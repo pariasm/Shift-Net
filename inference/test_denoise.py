@@ -59,6 +59,8 @@ class Inference:
         self.n_seq = 4
         self.size_must_mode = 4
         self.device = 'cuda'
+        self.mimo_length = args.mimo_length
+        self.mimo_padding = args.mimo_padding
 
         if not os.path.exists(self.result_path):
             os.mkdir(self.result_path)
@@ -79,8 +81,10 @@ class Inference:
         self.logger.write_log('n_seq: {}'.format(self.n_seq))
         self.logger.write_log('size_must_mode: {}'.format(self.size_must_mode))
         self.logger.write_log('device: {}'.format(self.device))
+        self.logger.write_log('mimo_length: {}'.format(self.mimo_length))
+        self.logger.write_log('mimo_padding: {}'.format(self.mimo_padding))
 
-        self.net = GShiftNet(future_frames=2, past_frames=2)
+        self.net = GShiftNet(future_frames=self.mimo_padding, past_frames=self.mimo_padding)
         self.net.load_state_dict(torch.load(self.model_path)['params'])
         # self.net.half()
         self.net = self.net.to(self.device)
@@ -88,7 +92,7 @@ class Inference:
         self.net.eval()
         # exit(0)
 
-    def infer(self, sigma, one_len):
+    def infer(self, sigma, fixed_noise=False):
         with torch.no_grad():
             total_psnr = {}
             total_ssim = {}
@@ -96,6 +100,10 @@ class Inference:
             # print(len(videos))
             # exit(0)
             for v in videos:
+                
+                if args.fixed_noise:
+                    np.random.seed(2023)
+
                 video_psnr = []
                 video_ssim = []
                 input_frames = sorted(glob.glob(os.path.join(self.input_path, v, "*")))
@@ -108,30 +116,34 @@ class Inference:
                 # gt_seqs = self.gene_seq(gt_frames, n_seq=self.n_seq)
                 # for in_seq, gt_seq in zip(input_seqs, gt_seqs):
                 # 
-                begin_frames = 2 
-                end_frames = 2
+                begin_frames = self.mimo_padding 
+                end_frames = self.mimo_padding
                 # pad_h = 18
                 # pad = 16
-                one_len = (len(input_frames) - begin_frames - end_frames) #// 2
-                if one_len > 100:
-                    one_len = one_len // 2 # 62, 127 125 
-                    
-                k_len = (len(input_frames) - begin_frames - end_frames) // one_len
-                k_residual = (len(input_frames) - begin_frames - end_frames) % one_len
-                # print(k_len, k_residual, len(input_frames) - begin_frames - end_frames, one_len)
+
+                mimo_length = self.mimo_length
+                if mimo_length == 0:
+                    mimo_length = (len(input_frames) - begin_frames - end_frames) #// 2
+
+                if mimo_length > 100:
+                    mimo_length = mimo_length // 2 # 62, 127 125 
+
+                k_len = (len(input_frames) - begin_frames - end_frames) // mimo_length
+                k_residual = (len(input_frames) - begin_frames - end_frames) % mimo_length
+                # print(k_len, k_residual, len(input_frames) - begin_frames - end_frames, mimo_length)
                 index = 0
                 for kk in range(k_len):
                     start_time = time.time()
                     kk_add = 0
                     if kk == k_len - 1:
-                        in_seq = input_frames[kk*one_len+0:kk*one_len+one_len+k_residual+begin_frames+end_frames]
-                        gt_seq = input_frames[kk*one_len+begin_frames:kk*one_len+one_len+k_residual+end_frames]
+                        in_seq = input_frames[kk*mimo_length+0:kk*mimo_length+mimo_length+k_residual+begin_frames+end_frames]
+                        gt_seq = input_frames[kk*mimo_length+begin_frames:kk*mimo_length+mimo_length+k_residual+end_frames]
                         kk_add = k_residual
                     else:
-                        in_seq = input_frames[kk*one_len+0:kk*one_len+one_len+begin_frames+end_frames]
-                        gt_seq = input_frames[kk*one_len+begin_frames:kk*one_len+one_len+end_frames]
-                        # one_len = one_len + k_residual
-                    
+                        in_seq = input_frames[kk*mimo_length+0:kk*mimo_length+mimo_length+begin_frames+end_frames]
+                        gt_seq = input_frames[kk*mimo_length+begin_frames:kk*mimo_length+mimo_length+end_frames]
+                        # mimo_length = mimo_length + k_residual
+
                     filename = os.path.basename(in_seq[self.n_seq // 2]).split('.')[0]
                     inputs = [imageio.imread(p) for p in in_seq]
                     # gt = imageio.imread(gt_seq[self.n_seq // 2])
@@ -143,20 +155,20 @@ class Inference:
                     in_tensor = self.numpy2tensor(inputs)# .to(self.device)
                     B, N, _, H, W = in_tensor.shape
                     std1 = sigma
-                    noise = torch.empty_like(in_tensor).normal_(mean=0, std=std1) #.cuda().half()
+                    noise = torch.Tensor(np.random.normal(0, std1, in_tensor.shape))
+#                   noise = torch.empty_like(in_tensor).normal_(mean=0, std=std1) #.cuda().half()
                     in_tensor = (in_tensor + noise).to(self.device)
                     std_map = torch.FloatTensor([std1]).view(1,1,1,1,1).cuda()#.half()
                     # std_map = std_map.expand((B, N, 1, H, W))
                     preprocess_time = time.time()
-                    print(in_tensor.shape)
                     # exit(0)
-                    output = torch.zeros(one_len+kk_add,3,H,W) # 240, 426
+                    output = torch.zeros(mimo_length+kk_add,3,H,W) # 240, 426
                     pad_h = 32 - (H//2 % 16)
                     pad = 32 - (W//2 % 16)
                     # print(output.shape, pad_h, pad, H//2 + pad_h, W//2 + pad)
                     # exit(0)
                     # 480, 852 ---
-                    
+
                     # output, _ = self.net(in_tensor.half(), std_map)
                     # output1 = self.net(in_tensor.half()[:,:,:,0:H//2+pad_h,0:W//2+pad], std_map[:,:,:,0:H//2+pad_h,0:W//2+pad])
                     output1 = self.net(in_tensor[:,:,:,0:H//2+pad_h,0:W//2+pad], std_map.expand(B, N, 1, H//2+pad_h, W//2+pad))
@@ -173,10 +185,10 @@ class Inference:
                     output[...,H//2:,W//2:] = output4.float()[...,pad_h:,pad:]
                     forward_time = time.time()
                     # exit(0)
-                    for ele in range(one_len+kk_add):
+                    for ele in range(mimo_length+kk_add):
                         output_img = output[ele].clamp(0,1.0).permute(1,2,0).cpu().numpy()
                         output_img = output_img * 255
-                        input_img = in_tensor[0][ele+begin_frames].clamp(0,1.0).permute(1,2,0).cpu().numpy()
+                        input_img = in_tensor[0][ele+begin_frames].permute(1,2,0).cpu().numpy()
                         input_img = input_img * 255
                         psnr = PSNR_(output_img, gts[ele], data_range=255)
                         ssim = ssim_calculate(output_img, gts[ele])
@@ -187,8 +199,8 @@ class Inference:
                         if self.save_image:
                             if not os.path.exists(os.path.join(self.result_path, v)):
                                 os.mkdir(os.path.join(self.result_path, v))
-                            cv2.imwrite(os.path.join(self.result_path, v, '%03d.png'%index), output_img[...,::-1])
-                            # cv2.imwrite(os.path.join(self.result_path, v, '%03d_in.png'%index), input_img[...,::-1])
+                            cv2.imwrite(os.path.join(self.result_path, v, '%03d.png' % index), output_img[...,::-1])
+                            # np.save(os.path.join(self.result_path, v, '%03d_in.npy' % index), input_img[...,::-1])
                             # cv2.imwrite(os.path.join(self.result_path, v, '%03d_gt.png'%index), gts[ele][...,::-1])
                             # exit(0)
                         index = index + 1
@@ -323,11 +335,13 @@ if __name__ == '__main__':
 
     parser.add_argument('--default_data', type=str, default='.',
                         help='quick test, optional: DVD, GOPRO')
-    parser.add_argument('--sigma', type=int, default=10,
-                        help='sigma')
-    parser.add_argument('--one', type=int, default=10,
-                        help='sigma')
+    parser.add_argument('--sigma', type=int, default=10, help='sigma')
+    parser.add_argument('--mimo_length', type=int, default=0, help='number of frames in mimo group')
+    parser.add_argument('--mimo_padding', type=int, default=2, help='number of past and future frames added')
+    parser.add_argument('--result_path', type=str, default=None, help='result path')
+    parser.add_argument('--fixed_noise', action='store_true', help='use fixed seed per sequence')
     args = parser.parse_args()
+
     if args.default_data == 'DAVIS':
         args.data_path = './dataset/DAVIS-test'
         args.model_path = 'pretrained_models/net_denoise.pth'
@@ -346,7 +360,41 @@ if __name__ == '__main__':
         args.result_path = args.result_path + "sigma%d"%(args.sigma)
         if not os.path.exists(args.result_path):
             os.mkdir(args.result_path)
+#### MODIF LARA
+    elif args.default_data == 'DroneRGB':
+        args.data_path = '/mnt/adisk/pariasm/drone-rgb-dataset/noisy-short/png/AWGN%d' % args.sigma
+        args.gt_data_path = '/home/lara/Shift-Net/dataset/drone-rgb-dataset/gt'
+        args.result_path = 'infer_results/drone-rgb-dataset/plus/'
+        args.model_path = 'pretrained_models/net_denoise.pth'
+        if not os.path.exists(args.result_path):
+            os.makedirs(args.result_path)
+        args.result_path = os.path.join(args.result_path, "AWGN%d"%(args.sigma))
+        if not os.path.exists(args.result_path):
+            os.mkdir(args.result_path)
+        sigmas = [args.sigma]
+    elif args.default_data == 'IR2RGB':
+        args.data_path = '/mnt/adisk/thales/2023_BDD_THALES_IR/RGB-like_dataset/validation-warping_neighborhood'
+        args.gt_data_path = '/mnt/adisk/thales/2023_BDD_THALES_IR/RGB-like_dataset/validation-warping_neighborhood'
+        args.model_path = 'pretrained_models/net_denoise.pth'
+        args.result_path = 'infer_results/IR2RGB-dataset/plus/'
+        if not os.path.exists(args.result_path):
+            os.makedirs(args.result_path)
+        sigma_path = '/mnt/adisk/thales/2023_BDD_THALES_IR/RGB-like_dataset/val_std.txt'
+        sigmas = np.loadtxt(sigma_path, usecols=(1)) # read std file
+    elif args.default_data == 'DroneRGB_noise_free_input':
+        args.data_path = '/home/pariasm/remote/weird/mnt/adisk/pariasm/drone-rgb-dataset/gt-short'
+        args.gt_data_path = '/home/pariasm/remote/weird/mnt/adisk/pariasm/drone-rgb-dataset/gt-short'
+        if args.result_path == None:
+            args.result_path = 'results/drone-rgb-dataset-noise-free-input/plus/'
+        args.model_path = 'pretrained_models/net_denoise.pth'
+        if not os.path.exists(args.result_path):
+            os.makedirs(args.result_path)
+        args.result_path = os.path.join(args.result_path, "AWGN%d"%(args.sigma))
+        if not os.path.exists(args.result_path):
+            os.mkdir(args.result_path)
+        sigmas = np.asarray([args.sigma])
+#### END MODIF LARA
 
     Infer = Inference(args)
-    Infer.infer(args.sigma / 255.0, args.one)
+    Infer.infer(args.sigma / 255.0, args.fixed_noise)
 
